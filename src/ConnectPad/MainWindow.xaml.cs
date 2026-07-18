@@ -21,9 +21,10 @@ public partial class MainWindow : Window
         Loaded += async (_, _) => await RefreshDevicesAsync();
     }
 
-    private async void RefreshButton_Click(object sender, RoutedEventArgs e) => await RefreshDevicesAsync();
+    private async void RefreshButton_Click(object sender, RoutedEventArgs e) =>
+        await RefreshDevicesAsync(forceUsbRescan: true);
 
-    private async Task RefreshDevicesAsync(bool announce = true)
+    private async Task RefreshDevicesAsync(bool announce = true, bool forceUsbRescan = false)
     {
         if (!_adb.IsAvailable)
         {
@@ -38,7 +39,7 @@ public partial class MainWindow : Window
             SetStatus("正在检测设备…");
         }
 
-        var (result, devices) = await _adb.ListDevicesAsync();
+        var (result, devices) = await _adb.ListDevicesAsync(forceUsbRescan);
         DeviceBox.ItemsSource = devices;
         DeviceBox.SelectedItem = devices.FirstOrDefault(device => device.IsReady) ?? devices.FirstOrDefault();
 
@@ -138,13 +139,53 @@ public partial class MainWindow : Window
         }
 
         SetBusy(true);
-        SetStatus("正在启动…");
-        var result = await _scrcpy.StartAsync(device.Serial, streamResult =>
+        var profile = ScrcpyVideoProfile.UsbDefault;
+        WifiLinkInfo? wifi = null;
+        string? fallbackReason = null;
+
+        if (device.IsWireless)
+        {
+            SetStatus("正在检测无线链路…");
+            var wifiResult = await _adb.GetWifiStatusAsync(device.Serial);
+            if (wifiResult.Success)
+            {
+                wifi = WifiStatusParser.Parse(wifiResult.Output);
+            }
+
+            SetStatus("正在检测视频编码器…");
+            var encoderProbe = await _scrcpy.ProbeHardwareH265Async(device.Serial);
+            if (encoderProbe.Success && encoderProbe.Encoder is not null)
+            {
+                profile = ScrcpyVideoProfile.WirelessH265(encoderProbe.Encoder);
+            }
+            else
+            {
+                profile = ScrcpyVideoProfile.WirelessH264;
+                fallbackReason = encoderProbe.Success
+                    ? "未检测到硬件 H.265，已回退"
+                    : "编码器检测失败，已回退";
+            }
+        }
+
+        SetStatus($"正在启动 {profile.StatusLabel}…");
+        Action<CommandResult> onExit = streamResult =>
             Dispatcher.Invoke(() => SetStatus(streamResult.Success
                 ? "投屏已结束"
-                : $"投屏异常：{ShortText(ScrcpyService.LastLine(streamResult))}", !streamResult.Success)));
+                : $"投屏异常：{ShortText(ScrcpyService.LastLine(streamResult))}", !streamResult.Success));
+
+        var result = await _scrcpy.StartAsync(device.Serial, profile, onExit);
+        if (!result.Started && profile.IsH265)
+        {
+            profile = ScrcpyVideoProfile.WirelessH264;
+            fallbackReason = "H.265 启动失败，已回退";
+            SetStatus("H.265 启动失败，正在回退 H.264…");
+            result = await _scrcpy.StartAsync(device.Serial, profile, onExit);
+        }
+
         SetBusy(false);
-        SetStatus(result.Started ? "投屏已启动" : $"启动失败：{ShortText(result.Error)}", !result.Started);
+        SetStatus(result.Started
+            ? StreamStatus(profile, wifi?.Band, fallbackReason)
+            : $"启动失败：{ShortText(result.Error)}", !result.Started);
     }
 
     private void SetBusy(bool busy)
@@ -187,4 +228,20 @@ public partial class MainWindow : Window
     }
 
     private static string ShortText(string text) => text.Length <= 100 ? text : text[..100];
+
+    private static string StreamStatus(ScrcpyVideoProfile profile, string? band, string? fallbackReason)
+    {
+        var details = new List<string> { "投屏已启动", profile.StatusLabel };
+        if (!string.IsNullOrWhiteSpace(band))
+        {
+            details.Add(band);
+        }
+
+        if (!string.IsNullOrWhiteSpace(fallbackReason))
+        {
+            details.Add(fallbackReason);
+        }
+
+        return string.Join(" · ", details);
+    }
 }
