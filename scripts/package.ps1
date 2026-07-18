@@ -5,8 +5,8 @@ $root = Split-Path -Parent $PSScriptRoot
 $archive = Join-Path $root 'downloads\scrcpy-win64-v4.1.zip'
 $expectedHash = '5B12172B3264B2889F4583EE64752CE832E29BC8B1089DCA81093459697165DB'
 $artifacts = Join-Path $root 'artifacts'
-$publish = Join-Path $artifacts 'ConnectPad-win-x64-v0.1.0'
-$zip = Join-Path $artifacts 'ConnectPad-win-x64-v0.1.0.zip'
+$publish = Join-Path $artifacts 'ConnectPad-win-x64-v0.2.0'
+$zip = Join-Path $artifacts 'ConnectPad-win-x64-v0.2.0.zip'
 $project = Join-Path $root 'src\ConnectPad\ConnectPad.csproj'
 
 if (-not (Test-Path -LiteralPath $archive)) {

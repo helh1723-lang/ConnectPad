@@ -1,6 +1,8 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace ConnectPad;
 
@@ -97,13 +99,14 @@ internal static class ProcessRunner
 internal sealed record AdbDevice(string Serial, string State, string Model)
 {
     public bool IsReady => State.Equals("device", StringComparison.OrdinalIgnoreCase);
+    public bool IsWireless => Serial.Contains(':');
 
     public string DisplayName
     {
         get
         {
             var name = string.IsNullOrWhiteSpace(Model) ? Serial : Model;
-            var connection = Serial.Contains(':') ? "Wi-Fi" : "USB";
+            var connection = IsWireless ? "Wi-Fi" : "USB";
             var state = State.ToLowerInvariant() switch
             {
                 "device" => string.Empty,
@@ -113,6 +116,84 @@ internal sealed record AdbDevice(string Serial, string State, string Model)
             };
             return $"{name} · {connection}{state}";
         }
+    }
+}
+
+internal sealed record WifiLinkInfo(
+    int? FrequencyMhz,
+    int? RssiDbm,
+    int? TxLinkSpeedMbps,
+    double? RetryPercent,
+    double? LossPercent)
+{
+    public string? Band => FrequencyMhz switch
+    {
+        >= 2400 and < 2500 => "2.4 GHz",
+        >= 4900 and < 5925 => "5 GHz",
+        >= 5925 and <= 7125 => "6 GHz",
+        _ => null
+    };
+}
+
+internal static class WifiStatusParser
+{
+    public static WifiLinkInfo? Parse(string output)
+    {
+        var frequency = ParseInt(output, @"\bFrequency:\s*(\d+)\s*MHz");
+        var rssi = ParseInt(output, @"\bRSSI:\s*(-?\d+)");
+        var txLinkSpeed = ParseInt(output, @"\bTx Link speed:\s*(\d+)\s*Mbps")
+                          ?? ParseInt(output, @"\bLink speed:\s*(\d+)\s*Mbps");
+
+        var successful = ParseDouble(output, @"\bsuccessfulTxPacketsPerSecond:\s*([\d.eE+-]+)");
+        var retried = ParseDouble(output, @"\bretriedTxPacketsPerSecond:\s*([\d.eE+-]+)");
+        var lost = ParseDouble(output, @"\blostTxPacketsPerSecond:\s*([\d.eE+-]+)");
+        if (successful is null || retried is null || lost is null)
+        {
+            successful = ParseDouble(output, @"\bsuccessfulTxPackets:\s*([\d.eE+-]+)");
+            retried = ParseDouble(output, @"\bretriedTxPackets:\s*([\d.eE+-]+)");
+            lost = ParseDouble(output, @"\blostTxPackets:\s*([\d.eE+-]+)");
+        }
+
+        double? retryPercent = null;
+        double? lossPercent = null;
+        if (successful is not null && retried is not null && lost is not null)
+        {
+            var total = successful.Value + retried.Value + lost.Value;
+            if (total > 0)
+            {
+                retryPercent = retried.Value / total * 100;
+                lossPercent = lost.Value / total * 100;
+            }
+        }
+
+        if (frequency is null
+            && rssi is null
+            && txLinkSpeed is null
+            && retryPercent is null
+            && lossPercent is null)
+        {
+            return null;
+        }
+
+        return new(frequency, rssi, txLinkSpeed, retryPercent, lossPercent);
+    }
+
+    private static int? ParseInt(string text, string pattern)
+    {
+        var match = Regex.Match(text, pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return match.Success
+               && int.TryParse(match.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+            ? value
+            : null;
+    }
+
+    private static double? ParseDouble(string text, string pattern)
+    {
+        var match = Regex.Match(text, pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return match.Success
+               && double.TryParse(match.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
+            ? value
+            : null;
     }
 }
 
@@ -171,39 +252,132 @@ internal sealed class AdbService(ToolPaths paths)
 {
     public bool IsAvailable => File.Exists(paths.Adb);
 
-    public async Task<(CommandResult Result, IReadOnlyList<AdbDevice> Devices)> ListDevicesAsync()
+    public async Task<(CommandResult Result, IReadOnlyList<AdbDevice> Devices)> ListDevicesAsync(bool forceUsbRescan = false)
     {
         var result = await ProcessRunner.RunAsync(paths.Adb, ["devices", "-l"]);
-        return (result, result.Success ? AdbDeviceParser.Parse(result.Output) : []);
+        var devices = result.Success ? AdbDeviceParser.Parse(result.Output) : [];
+        if (result.Success && ShouldRestartForUsb(devices, forceUsbRescan))
+        {
+            await ProcessRunner.RunAsync(paths.Adb, ["kill-server"]);
+            result = await ProcessRunner.RunAsync(paths.Adb, ["devices", "-l"]);
+            devices = result.Success ? AdbDeviceParser.Parse(result.Output) : [];
+        }
+
+        return (result, devices);
     }
+
+    internal static bool ShouldRestartForUsb(IReadOnlyList<AdbDevice> devices, bool forceUsbRescan) =>
+        devices.All(device => device.IsWireless)
+        && (forceUsbRescan || devices.All(device => !device.IsReady));
 
     public Task<CommandResult> PairAsync(string endpoint, string pairingCode) =>
         ProcessRunner.RunAsync(paths.Adb, ["pair", endpoint], pairingCode + Environment.NewLine, 30);
 
     public Task<CommandResult> ConnectAsync(string endpoint) =>
         ProcessRunner.RunAsync(paths.Adb, ["connect", endpoint], timeoutSeconds: 30);
+
+    public Task<CommandResult> GetWifiStatusAsync(string serial) =>
+        ProcessRunner.RunAsync(paths.Adb, ["-s", serial, "shell", "cmd", "wifi", "status"], timeoutSeconds: 5);
+}
+
+internal sealed record ScrcpyVideoProfile(
+    string Codec,
+    int BitRateMbps,
+    string? Encoder,
+    bool SetBitRate,
+    bool NoDownsizeOnError)
+{
+    public static ScrcpyVideoProfile UsbDefault { get; } = new("h264", 8, null, false, false);
+    public static ScrcpyVideoProfile WirelessH264 { get; } = new("h264", 8, null, true, true);
+
+    public static ScrcpyVideoProfile WirelessH265(string encoder) =>
+        new("h265", 4, encoder, true, true);
+
+    public bool IsH265 => Codec.Equals("h265", StringComparison.OrdinalIgnoreCase);
+    public string StatusLabel => $"{(IsH265 ? "H.265" : "H.264")} {BitRateMbps} Mbps";
 }
 
 internal static class ScrcpyProfile
 {
-    public static IReadOnlyList<string> BuildArguments(string serial) =>
-    [
-        $"--serial={serial}",
-        "--video-codec=h264",
-        "--max-fps=60",
-        "--max-size=1920",
-        "--no-audio",
-        "--keep-active",
-        "--window-title=ConnectPad"
-    ];
+    public static IReadOnlyList<string> BuildArguments(string serial, ScrcpyVideoProfile profile)
+    {
+        var arguments = new List<string>
+        {
+            $"--serial={serial}",
+            $"--video-codec={profile.Codec}"
+        };
+
+        if (!string.IsNullOrWhiteSpace(profile.Encoder))
+        {
+            arguments.Add($"--video-encoder={profile.Encoder}");
+        }
+
+        if (profile.SetBitRate)
+        {
+            arguments.Add($"--video-bit-rate={profile.BitRateMbps}M");
+        }
+
+        arguments.Add("--max-fps=60");
+        arguments.Add("--max-size=1920");
+        arguments.Add("--no-audio");
+        arguments.Add("--keep-active");
+        if (profile.NoDownsizeOnError)
+        {
+            arguments.Add("--no-downsize-on-error");
+        }
+
+        arguments.Add("--window-title=ConnectPad");
+        return arguments;
+    }
+}
+
+internal static class ScrcpyEncoderParser
+{
+    public static string? FindHardwareH265(string output)
+    {
+        foreach (var line in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (!line.Contains("--video-codec=h265", StringComparison.OrdinalIgnoreCase)
+                || !line.Contains("(hw)", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var match = Regex.Match(
+                line,
+                @"--video-encoder=(?:'(?<single>[^']+)'|""(?<double>[^""]+)""|(?<plain>\S+))",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            if (match.Success)
+            {
+                return new[] { "single", "double", "plain" }
+                    .Select(name => match.Groups[name].Value)
+                    .First(value => !string.IsNullOrWhiteSpace(value));
+            }
+        }
+
+        return null;
+    }
 }
 
 internal sealed class ScrcpyService(ToolPaths paths)
 {
     public bool IsAvailable => File.Exists(paths.Scrcpy);
 
+    public async Task<(bool Success, string? Encoder, string Error)> ProbeHardwareH265Async(string serial)
+    {
+        var result = await ProcessRunner.RunAsync(
+            paths.Scrcpy,
+            [$"--serial={serial}", "--list-encoders"],
+            timeoutSeconds: 10);
+        var output = result.Output + Environment.NewLine + result.Error;
+        return result.Success
+            ? (true, ScrcpyEncoderParser.FindHardwareH265(output), string.Empty)
+            : (false, null, LastLine(result));
+    }
+
     public async Task<(bool Started, string Error)> StartAsync(
         string serial,
+        ScrcpyVideoProfile profile,
         Action<CommandResult> onExit)
     {
         var startInfo = new ProcessStartInfo
@@ -219,7 +393,7 @@ internal sealed class ScrcpyService(ToolPaths paths)
         };
         startInfo.Environment["ADB_LIBUSB"] = "1";
 
-        foreach (var argument in ScrcpyProfile.BuildArguments(serial))
+        foreach (var argument in ScrcpyProfile.BuildArguments(serial, profile))
         {
             startInfo.ArgumentList.Add(argument);
         }
@@ -243,7 +417,8 @@ internal sealed class ScrcpyService(ToolPaths paths)
         var errorTask = process.StandardError.ReadToEndAsync();
         var exitTask = process.WaitForExitAsync();
 
-        if (await Task.WhenAny(exitTask, Task.Delay(1200)) == exitTask)
+        var startupProbeMilliseconds = profile.IsH265 ? 5000 : 1200;
+        if (await Task.WhenAny(exitTask, Task.Delay(startupProbeMilliseconds)) == exitTask)
         {
             await exitTask;
             var result = new CommandResult(process.ExitCode, await outputTask, await errorTask);
@@ -296,8 +471,13 @@ internal static class CoreSelfTest
 
             Expect(devices.Count == 3, "device count");
             Expect(devices[0].Model == "Galaxy Tab" && devices[0].DisplayName.Contains("USB"), "USB parse");
-            Expect(devices[1].DisplayName.Contains("Wi-Fi"), "Wi-Fi parse");
+            Expect(devices[1].IsWireless && devices[1].DisplayName.Contains("Wi-Fi"), "Wi-Fi parse");
             Expect(!devices[2].IsReady && devices[2].DisplayName.Contains("未授权"), "state parse");
+            Expect(!AdbService.ShouldRestartForUsb(devices, true), "existing USB skips rescan");
+            Expect(!AdbService.ShouldRestartForUsb([devices[1]], false), "ready Wi-Fi keeps server");
+            Expect(AdbService.ShouldRestartForUsb([new("192.168.1.8:37123", "offline", string.Empty)], false), "offline Wi-Fi triggers recovery");
+            Expect(AdbService.ShouldRestartForUsb([devices[1]], true), "manual USB rescan");
+            Expect(AdbService.ShouldRestartForUsb([], false), "empty list triggers recovery");
             Expect(InputValidation.IsEndpoint("192.168.1.8:37123"), "IPv4 endpoint");
             Expect(InputValidation.IsEndpoint("[fe80::1]:37123"), "IPv6 endpoint");
             Expect(!InputValidation.IsEndpoint("192.168.1.8"), "missing port");
@@ -305,12 +485,46 @@ internal static class CoreSelfTest
             Expect(InputValidation.IsPairingCode("123456"), "pairing code");
             Expect(!InputValidation.IsPairingCode("12345x"), "invalid pairing code");
 
-            var arguments = ScrcpyProfile.BuildArguments("ABC123");
-            Expect(arguments.Contains("--serial=ABC123"), "serial argument");
-            Expect(arguments.Contains("--video-codec=h264"), "codec argument");
-            Expect(arguments.Contains("--max-fps=60"), "fps argument");
-            Expect(arguments.Contains("--max-size=1920"), "size argument");
-            Expect(arguments.Contains("--no-audio"), "audio argument");
+            var wifi = WifiStatusParser.Parse(
+                "WifiInfo: RSSI: -42, Link speed: 144Mbps, Tx Link speed: 72Mbps, Frequency: 2437MHz\n" +
+                "successfulTxPacketsPerSecond: 80\nretriedTxPacketsPerSecond: 10\nlostTxPacketsPerSecond: 10\n");
+            var parsedWifi = wifi ?? throw new InvalidOperationException("Self-test failed: Wi-Fi status");
+            Expect(parsedWifi is { Band: "2.4 GHz", FrequencyMhz: 2437, RssiDbm: -42, TxLinkSpeedMbps: 72 }, "Wi-Fi status");
+            Expect(Math.Abs(parsedWifi.RetryPercent!.Value - 10) < 0.001, "Wi-Fi retry rate");
+            Expect(Math.Abs(parsedWifi.LossPercent!.Value - 10) < 0.001, "Wi-Fi loss rate");
+            Expect(WifiStatusParser.Parse("Wifi status unavailable") is null, "unreadable Wi-Fi status");
+
+            var encoders =
+                "--video-codec=h264 --video-encoder=c2.vendor.avc.encoder (hw) [vendor]\n" +
+                "--video-codec=h265 --video-encoder=c2.android.hevc.encoder (sw)\n" +
+                "--video-codec=h265 --video-encoder='c2.vendor.hevc.encoder' (hw) [vendor]\n";
+            Expect(ScrcpyEncoderParser.FindHardwareH265(encoders) == "c2.vendor.hevc.encoder", "hardware H.265 encoder");
+            Expect(ScrcpyEncoderParser.FindHardwareH265("--video-codec=h265 --video-encoder=c2.android.hevc.encoder (sw)") is null, "software-only H.265");
+
+            var usbArguments = ScrcpyProfile.BuildArguments("ABC123", ScrcpyVideoProfile.UsbDefault);
+            Expect(usbArguments.SequenceEqual(new[]
+            {
+                "--serial=ABC123",
+                "--video-codec=h264",
+                "--max-fps=60",
+                "--max-size=1920",
+                "--no-audio",
+                "--keep-active",
+                "--window-title=ConnectPad"
+            }), "unchanged USB arguments");
+
+            var h264Arguments = ScrcpyProfile.BuildArguments("192.168.1.8:37123", ScrcpyVideoProfile.WirelessH264);
+            Expect(h264Arguments.Contains("--video-bit-rate=8M"), "wireless H.264 bitrate");
+            Expect(h264Arguments.Contains("--no-downsize-on-error"), "wireless H.264 resolution lock");
+
+            var h265Arguments = ScrcpyProfile.BuildArguments(
+                "192.168.1.8:37123",
+                ScrcpyVideoProfile.WirelessH265("c2.vendor.hevc.encoder"));
+            Expect(h265Arguments.Contains("--video-codec=h265"), "H.265 codec");
+            Expect(h265Arguments.Contains("--video-encoder=c2.vendor.hevc.encoder"), "H.265 encoder");
+            Expect(h265Arguments.Contains("--video-bit-rate=4M"), "H.265 bitrate");
+            Expect(h265Arguments.Contains("--max-fps=60") && h265Arguments.Contains("--max-size=1920"), "wireless frame limits");
+            Expect(h265Arguments.Contains("--no-audio") && h265Arguments.Contains("--no-downsize-on-error"), "wireless quality arguments");
             return 0;
         }
         catch (Exception exception)
